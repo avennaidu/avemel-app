@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import * as XLSX from "xlsx";
 
 const RED = "#EA2227";
 const DARK = "#1b1b1b";
@@ -139,11 +140,20 @@ const LEG_LABEL = { import: "Imports", export: "Exports", local: "Local" };
 
 const OPS_PIN = "Avemel26";
 const ADMIN_PIN = "Avemel27";
+const WORKSHOP_PIN = "Avemel28";
+const FAULT_SEV = ["Minor", "Major", "Critical"];
+const FAULT_SEV_COLOR = { Minor: "#b58100", Major: "#d2691e", Critical: "#b00020" };
+// Vehicle regs that currently have an unresolved workshop fault.
+const faultedRegs = (data) => new Set((data.faults || []).filter(f => f.status === "open").map(f => f.vehicle));
 // Session persists only in the deployed build (window.authStore). In the Claude
 // preview it stays in memory, so you sign in again after a full reload.
 const SESSION_STORE = (typeof window !== "undefined" && window.authStore) ? window.authStore : null;
 function loadSession() { try { return SESSION_STORE ? JSON.parse(SESSION_STORE.get() || "null") : null; } catch { return null; } }
 function persistSession(s) { try { if (SESSION_STORE) SESSION_STORE.set(s ? JSON.stringify(s) : "null"); } catch {} }
+// Tracks the newest announcement this device has seen (for unread badges).
+const NOTIF_STORE = (typeof window !== "undefined" && window.notifStore) ? window.notifStore : null;
+function loadSeen() { try { return NOTIF_STORE ? Number(NOTIF_STORE.get() || 0) : 0; } catch { return 0; } }
+function saveSeen(ts) { try { if (NOTIF_STORE) NOTIF_STORE.set(String(ts)); } catch {} }
 const LEAVE_TYPES = ["Annual leave", "Sick leave", "Family responsibility", "Unpaid leave"];
 const LEAVE_KEY = { "Annual leave": "annual", "Sick leave": "sick", "Family responsibility": "family" };
 const DEFAULT_BALANCE = { annual: 15, sick: 30, family: 3 };
@@ -318,6 +328,47 @@ const STATUS = {
 };
 const LEAVE_STATUS = { pending: "#b58100", approved: "#0a7d3f", declined: "#b00020" };
 
+// Export all loads (optionally for one month) to an Excel workbook: one row per
+// load plus a per-driver summary sheet.
+function exportLoads(trips, ym) {
+  const loads = trips
+    .filter(t => t.instruction && (!ym || monthKey(t.createdAt) === ym))
+    .slice()
+    .sort((a, b) => (a.driver || "").localeCompare(b.driver || "") || (a.createdAt || 0) - (b.createdAt || 0));
+  if (!loads.length) { alert("No loads to export for this period."); return; }
+
+  const rows = loads.map(t => ({
+    Driver: t.driver || "",
+    Date: fmtDate(t.createdAt),
+    Ref: t.instruction.ref || "",
+    Leg: LEG_LABEL[t.instruction.leg] || "Local",
+    "Load type": t.instruction.loadType || "",
+    Customer: t.instruction.customer || "",
+    "2nd customer": t.instruction.customer2 || "",
+    "Load site": t.instruction.loadSite || "",
+    "Offload site": t.instruction.offSite || "",
+    Vehicle: t.vehicle || "",
+    Trailer: trailerLabel(t),
+    Status: STATUS[t.status]?.label || t.status,
+    "Wage (R)": t.pay?.status === "approved" ? (t.pay.total || 0) : "",
+    Finalised: t.finalized ? "Yes" : "No",
+  }));
+
+  const byDriver = {};
+  loads.forEach(t => {
+    const d = t.driver || "-";
+    byDriver[d] = byDriver[d] || { Driver: d, Loads: 0, "Wages (R)": 0, Finalised: 0 };
+    byDriver[d].Loads++;
+    if (t.pay?.status === "approved") byDriver[d]["Wages (R)"] += t.pay.total || 0;
+    if (t.finalized) byDriver[d].Finalised++;
+  });
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Loads");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(Object.values(byDriver)), "Summary by driver");
+  XLSX.writeFile(wb, `Avemel-loads-${ym || "all"}.xlsx`);
+}
+
 function SignaturePad({ onChange }) {
   const ref = useRef();
   const drawing = useRef(false);
@@ -366,6 +417,251 @@ const Tabs = ({ value, onChange, tabs }) => (
   </div>
 );
 
+function FaultReport({ driver, fleet, data, activeTrip, addFault }) {
+  const [veh, setVeh] = useState(activeTrip?.vehicle || "");
+  const [sev, setSev] = useState("Major");
+  const [desc, setDesc] = useState("");
+  const mine = (data.faults || []).filter(f => f.reportedBy === driver);
+
+  const submit = () => {
+    if (!veh || !desc.trim()) return;
+    addFault({ id: uid(), vehicle: veh, severity: sev, desc: desc.trim(), reportedBy: driver, reportedAt: Date.now(), status: "open" });
+    setDesc(""); setSev("Major");
+  };
+
+  return (
+    <div>
+      <div className="bg-white rounded-xl p-4 border shadow-sm mb-3" style={{ borderColor: "#e5e5e5" }}>
+        <h3 className="font-bold mb-1" style={{ color: DARK }}>Report a fault</h3>
+        <p className="text-xs text-gray-500 mb-3">The vehicle goes to the workshop and can't be used again until they clear it.</p>
+
+        <label className="text-xs font-semibold text-gray-500">Vehicle</label>
+        <select value={veh} onChange={e => setVeh(e.target.value)} className="w-full mt-1 mb-3 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }}>
+          <option value="">Select vehicle\u2026</option>
+          {fleet.vehicles.map(x => <option key={x.reg} value={x.reg}>{x.reg} \u2014 {x.make}</option>)}
+        </select>
+
+        <label className="text-xs font-semibold text-gray-500">Severity</label>
+        <div className="flex gap-2 mt-1 mb-3">
+          {FAULT_SEV.map(s => (
+            <button key={s} onClick={() => setSev(s)} className="flex-1 py-2 rounded-lg text-sm font-semibold border" style={{ background: sev === s ? FAULT_SEV_COLOR[s] : "#fff", color: sev === s ? "#fff" : "#666", borderColor: sev === s ? FAULT_SEV_COLOR[s] : "#ddd" }}>{s}</button>
+          ))}
+        </div>
+
+        <label className="text-xs font-semibold text-gray-500">What's wrong?</label>
+        <textarea value={desc} onChange={e => setDesc(e.target.value)} rows={3} placeholder="Describe the fault" className="w-full mt-1 mb-3 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+
+        <button disabled={!veh || !desc.trim()} onClick={submit} className="w-full py-3 rounded-xl font-bold text-white disabled:opacity-40" style={{ background: RED }}>Report fault to workshop</button>
+      </div>
+
+      {mine.length > 0 && (
+        <div>
+          <h3 className="font-bold mb-2" style={{ color: DARK }}>My reported faults</h3>
+          <div className="space-y-2">
+            {mine.map(f => (
+              <div key={f.id} className="bg-white rounded-xl p-3 border shadow-sm" style={{ borderColor: f.status === "open" ? "#e5e5e5" : "#0a7d3f" }}>
+                <div className="flex justify-between items-start">
+                  <div className="font-bold" style={{ color: DARK }}>{f.vehicle}</div>
+                  <span className="text-[10px] font-bold px-2 py-1 rounded-full text-white" style={{ background: f.status === "open" ? FAULT_SEV_COLOR[f.severity] : "#0a7d3f" }}>{f.status === "open" ? f.severity : "Cleared"}</span>
+                </div>
+                <div className="text-xs text-gray-600 mt-1">{f.desc}</div>
+                <div className="text-[10px] text-gray-400 mt-1">Reported {fmt(f.reportedAt)}{f.status === "cleared" ? ` \u00b7 cleared by ${f.clearedBy} ${fmt(f.clearedAt)}` : ""}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FaultRow({ fault, clearFault }) {
+  const [open, setOpen] = useState(false);
+  const [by, setBy] = useState("");
+  const [note, setNote] = useState("");
+  return (
+    <div className="bg-white rounded-xl p-3 border shadow-sm" style={{ borderColor: FAULT_SEV_COLOR[fault.severity] }}>
+      <div className="flex justify-between items-start">
+        <div>
+          <div className="font-bold" style={{ color: DARK }}>{fault.vehicle}</div>
+          <div className="text-xs text-gray-600 mt-0.5">{fault.desc}</div>
+          <div className="text-[10px] text-gray-400 mt-1">By {fault.reportedBy} {"\u00b7"} {fmt(fault.reportedAt)}{fault.source === "checklist" ? " \u00b7 from pre-trip checklist" : ""}</div>
+        </div>
+        <span className="text-[10px] font-bold px-2 py-1 rounded-full text-white" style={{ background: FAULT_SEV_COLOR[fault.severity] }}>{fault.severity}</span>
+      </div>
+      {open ? (
+        <div className="mt-2 pt-2 border-t" style={{ borderColor: "#eee" }}>
+          <input value={by} onChange={e => setBy(e.target.value)} placeholder="Cleared by" className="w-full px-3 py-2 rounded-lg border text-sm mb-2" style={{ borderColor: "#ddd" }} />
+          <input value={note} onChange={e => setNote(e.target.value)} placeholder="Work done / note (optional)" className="w-full px-3 py-2 rounded-lg border text-sm mb-2" style={{ borderColor: "#ddd" }} />
+          <div className="flex gap-2">
+            <button onClick={() => setOpen(false)} className="flex-1 py-2 rounded-lg font-semibold text-sm border" style={{ borderColor: "#ddd", color: "#666" }}>Cancel</button>
+            <button onClick={() => clearFault(fault.id, by, note)} className="flex-1 py-2 rounded-lg font-bold text-white text-sm" style={{ background: "#0a7d3f" }}>Confirm cleared</button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={() => setOpen(true)} className="w-full mt-2 py-2 rounded-lg font-bold text-white text-sm" style={{ background: "#0a7d3f" }}>Clear vehicle for use</button>
+      )}
+    </div>
+  );
+}
+
+function WorkshopView({ data, fleet, addFault, clearFault }) {
+  const faults = data.faults || [];
+  const open = faults.filter(f => f.status === "open");
+  const cleared = faults.filter(f => f.status === "cleared");
+  const downRegs = new Set(open.map(f => f.vehicle));
+  const [showLog, setShowLog] = useState(false);
+  const [veh, setVeh] = useState(""); const [sev, setSev] = useState("Major"); const [desc, setDesc] = useState("");
+  const [showHist, setShowHist] = useState(false);
+
+  const log = () => {
+    if (!veh || !desc.trim()) return;
+    addFault({ id: uid(), vehicle: veh, severity: sev, desc: desc.trim(), reportedBy: "Workshop", reportedAt: Date.now(), status: "open" });
+    setVeh(""); setSev("Major"); setDesc(""); setShowLog(false);
+  };
+
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-2 mb-4">
+        <Stat n={downRegs.size} l="In workshop" hot={downRegs.size > 0} />
+        <Stat n={open.length} l="Open faults" hot={open.length > 0} />
+      </div>
+
+      <button onClick={() => setShowLog(!showLog)} className="w-full mb-3 py-2.5 rounded-lg font-bold text-white" style={{ background: DARK }}>{showLog ? "Close" : "Log a fault"}</button>
+      {showLog && (
+        <div className="bg-white rounded-xl p-4 border shadow-sm mb-4" style={{ borderColor: "#e5e5e5" }}>
+          <label className="text-xs font-semibold text-gray-500">Vehicle</label>
+          <select value={veh} onChange={e => setVeh(e.target.value)} className="w-full mt-1 mb-3 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }}>
+            <option value="">Select vehicle\u2026</option>
+            {fleet.vehicles.map(x => <option key={x.reg} value={x.reg}>{x.reg} \u2014 {x.make}</option>)}
+          </select>
+          <label className="text-xs font-semibold text-gray-500">Severity</label>
+          <div className="flex gap-2 mt-1 mb-3">
+            {FAULT_SEV.map(s => <button key={s} onClick={() => setSev(s)} className="flex-1 py-2 rounded-lg text-sm font-semibold border" style={{ background: sev === s ? FAULT_SEV_COLOR[s] : "#fff", color: sev === s ? "#fff" : "#666", borderColor: sev === s ? FAULT_SEV_COLOR[s] : "#ddd" }}>{s}</button>)}
+          </div>
+          <textarea value={desc} onChange={e => setDesc(e.target.value)} rows={3} placeholder="Describe the fault" className="w-full mb-3 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+          <button disabled={!veh || !desc.trim()} onClick={log} className="w-full py-3 rounded-xl font-bold text-white disabled:opacity-40" style={{ background: RED }}>Log fault</button>
+        </div>
+      )}
+
+      <h3 className="font-bold mb-2" style={{ color: DARK }}>Vehicles in the workshop</h3>
+      {open.length === 0 && <div className="text-sm text-gray-400 bg-white rounded-xl p-4 border" style={{ borderColor: "#e5e5e5" }}>No open faults. Whole fleet is available.</div>}
+      <div className="space-y-2">
+        {open.map(f => <FaultRow key={f.id} fault={f} clearFault={clearFault} />)}
+      </div>
+
+      {cleared.length > 0 && (
+        <div className="mt-5">
+          <button onClick={() => setShowHist(!showHist)} className="text-sm underline text-gray-500">{showHist ? "Hide" : "Show"} cleared history ({cleared.length})</button>
+          {showHist && (
+            <div className="space-y-2 mt-2">
+              {cleared.map(f => (
+                <div key={f.id} className="bg-white rounded-xl p-3 border shadow-sm" style={{ borderColor: "#0a7d3f" }}>
+                  <div className="flex justify-between items-start">
+                    <div className="font-bold" style={{ color: DARK }}>{f.vehicle}</div>
+                    <span className="text-[10px] font-bold px-2 py-1 rounded-full text-white" style={{ background: "#0a7d3f" }}>Cleared</span>
+                  </div>
+                  <div className="text-xs text-gray-600 mt-1">{f.desc}</div>
+                  {f.clearNote && <div className="text-xs text-gray-500 mt-0.5">Work: {f.clearNote}</div>}
+                  <div className="text-[10px] text-gray-400 mt-1">Reported by {f.reportedBy} {fmt(f.reportedAt)} {"\u00b7"} cleared by {f.clearedBy} {fmt(f.clearedAt)}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AnnouncementsPanel({ announcements, seen = 0, onClose }) {
+  const [perm, setPerm] = useState(typeof Notification !== "undefined" ? Notification.permission : "unsupported");
+  const enable = async () => {
+    if (typeof window !== "undefined" && window.avemelEnablePush) {
+      await window.avemelEnablePush();
+      setPerm(typeof Notification !== "undefined" ? Notification.permission : "granted");
+      return;
+    }
+    if (typeof Notification !== "undefined") Notification.requestPermission().then(setPerm);
+  };
+  const isNew = (a) => a.at > seen;
+  const list = [...announcements].sort((a, b) => (isNew(b) - isNew(a)) || (b.at - a.at));
+  const unread = announcements.filter(isNew).length;
+  return (
+    <div className="fixed inset-0 z-40" style={{ background: "rgba(0,0,0,0.35)" }} onClick={onClose}>
+      <div className="max-w-md mx-auto bg-white min-h-full" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: "#e5e5e5" }}>
+          <div className="font-bold" style={{ color: DARK }}>Announcements{unread > 0 ? <span className="ml-2 text-[10px] font-bold text-white rounded-full px-2 py-0.5" style={{ background: RED }}>{unread} new</span> : null}</div>
+          <button onClick={onClose} className="text-sm font-semibold" style={{ color: RED }}>{unread > 0 ? "Mark read" : "Close"}</button>
+        </div>
+        {perm !== "granted" && perm !== "unsupported" && (
+          <button onClick={enable} className="w-full text-left px-4 py-2.5 text-sm border-b" style={{ borderColor: "#eee", color: "#0b69c7" }}>
+            Turn on push alerts on this device
+          </button>
+        )}
+        <div className="p-4 space-y-2">
+          {list.length === 0 && <div className="text-sm text-gray-400">No announcements yet.</div>}
+          {list.map(a => (
+            <div key={a.id} className="rounded-xl p-3 border shadow-sm" style={{ borderColor: a.priority === "urgent" ? RED : (isNew(a) ? "#0b69c7" : "#e5e5e5"), background: isNew(a) ? "#f5f9ff" : "#fff" }}>
+              <div className="flex justify-between items-start gap-2">
+                <div className="font-bold" style={{ color: a.priority === "urgent" ? RED : DARK }}>{a.priority === "urgent" ? "\u26a0 " : ""}{a.title}</div>
+                {isNew(a) && <span className="text-[9px] font-bold text-white rounded-full px-2 py-0.5 shrink-0" style={{ background: "#0b69c7" }}>NEW</span>}
+              </div>
+              <div className="text-sm text-gray-700 mt-1 whitespace-pre-wrap">{a.body}</div>
+              <div className="text-[10px] text-gray-400 mt-2">{a.by} {"\u00b7"} {fmt(a.at)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AnnounceCompose({ data, addAnnouncement, removeAnnouncement }) {
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [urgent, setUrgent] = useState(false);
+  const [by, setBy] = useState("");
+  const list = [...(data.announcements || [])].sort((a, b) => b.at - a.at);
+
+  const post = () => {
+    if (!title.trim() || !body.trim()) return;
+    addAnnouncement({ id: uid(), title: title.trim(), body: body.trim(), priority: urgent ? "urgent" : "normal", by: by.trim() || "Management", at: Date.now() });
+    setTitle(""); setBody(""); setUrgent(false);
+  };
+
+  return (
+    <div>
+      <div className="bg-white rounded-xl p-4 border shadow-sm mb-4" style={{ borderColor: "#e5e5e5" }}>
+        <h3 className="font-bold mb-1" style={{ color: DARK }}>New announcement</h3>
+        <p className="text-xs text-gray-500 mb-3">Goes to everyone signed in - drivers, control room and workshop.</p>
+        <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Title" className="w-full mb-2 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+        <textarea value={body} onChange={e => setBody(e.target.value)} rows={4} placeholder="Message" className="w-full mb-2 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+        <input value={by} onChange={e => setBy(e.target.value)} placeholder="From (optional)" className="w-full mb-2 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+        <label className="flex items-center gap-2 mb-3 text-sm" style={{ color: DARK }}>
+          <input type="checkbox" checked={urgent} onChange={e => setUrgent(e.target.checked)} /> Mark as urgent
+        </label>
+        <button disabled={!title.trim() || !body.trim()} onClick={post} className="w-full py-3 rounded-xl font-bold text-white disabled:opacity-40" style={{ background: RED }}>Post announcement</button>
+      </div>
+
+      <h3 className="font-bold mb-2" style={{ color: DARK }}>Posted</h3>
+      {list.length === 0 && <div className="text-sm text-gray-400 bg-white rounded-xl p-4 border" style={{ borderColor: "#e5e5e5" }}>Nothing posted yet.</div>}
+      <div className="space-y-2">
+        {list.map(a => (
+          <div key={a.id} className="bg-white rounded-xl p-3 border shadow-sm" style={{ borderColor: a.priority === "urgent" ? RED : "#e5e5e5" }}>
+            <div className="flex justify-between items-start">
+              <div className="font-bold" style={{ color: a.priority === "urgent" ? RED : DARK }}>{a.priority === "urgent" ? "\u26a0 " : ""}{a.title}</div>
+              <button onClick={() => removeAnnouncement(a.id)} className="text-xs underline text-gray-400">Delete</button>
+            </div>
+            <div className="text-sm text-gray-700 mt-1 whitespace-pre-wrap">{a.body}</div>
+            <div className="text-[10px] text-gray-400 mt-2">{a.by} {"\u00b7"} {fmt(a.at)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function LoginGate({ signIn }) {
   const [mode, setMode] = useState("choose");
   const [pin, setPin] = useState("");
@@ -387,17 +683,21 @@ function LoginGate({ signIn }) {
           <button onClick={() => { setMode("admin"); setPin(""); setErr(""); }} className={card} style={{ borderColor: "#e5e5e5" }}>
             <span>Admin &amp; Payroll<span className="block text-xs font-normal text-gray-400">PIN required</span></span><span style={{ color: RED }}>{"\u203a"}</span>
           </button>
+          <button onClick={() => { setMode("workshop"); setPin(""); setErr(""); }} className={card} style={{ borderColor: "#e5e5e5" }}>
+            <span>Workshop<span className="block text-xs font-normal text-gray-400">Fault clearing - PIN required</span></span><span style={{ color: RED }}>{"\u203a"}</span>
+          </button>
         </div>
       </div>
     );
   }
 
-  const isOps = mode === "ops";
-  const submit = () => { if (pin === (isOps ? OPS_PIN : ADMIN_PIN)) signIn({ role: isOps ? "ops" : "admin", driver: null }); else setErr("Incorrect PIN. Try again."); };
+  const META = { ops: { label: "Operations", pin: OPS_PIN }, admin: { label: "Admin & Payroll", pin: ADMIN_PIN }, workshop: { label: "Workshop", pin: WORKSHOP_PIN } };
+  const m = META[mode];
+  const submit = () => { if (pin === m.pin) signIn({ role: mode, driver: null }); else setErr("Incorrect PIN. Try again."); };
   return (
     <div>
       <button onClick={() => { setMode("choose"); setErr(""); }} className="text-xs underline text-gray-500 mb-3">{"\u2039"} Back</button>
-      <h2 className="text-lg font-bold mb-1" style={{ color: DARK }}>{isOps ? "Operations" : "Admin & Payroll"}</h2>
+      <h2 className="text-lg font-bold mb-1" style={{ color: DARK }}>{m.label}</h2>
       <p className="text-sm text-gray-500 mb-4">Enter your PIN to continue.</p>
       <input autoFocus type="password" value={pin} onChange={e => { setPin(e.target.value); setErr(""); }} onKeyDown={e => { if (e.key === "Enter") submit(); }}
         placeholder="PIN" className="w-full px-3 py-3 rounded-xl border text-sm mb-2" style={{ borderColor: err ? RED : "#ddd" }} />
@@ -411,7 +711,7 @@ export default function App() {
   const saved = loadSession();
   const [session, setSession] = useState(saved);
   const [view, setView] = useState("driver");
-  const [data, setData] = useState({ trips: [], leave: [], payslips: {}, updatedAt: 0 });
+  const [data, setData] = useState({ trips: [], leave: [], payslips: {}, faults: [], announcements: [], updatedAt: 0 });
   const [fleet, setFleet] = useState({ ...SEED, rates: RATE_DEFAULTS, updatedAt: 0 });
   const [ready, setReady] = useState(false);
   const dataRef = useRef(data); useEffect(() => { dataRef.current = data; }, [data]);
@@ -419,6 +719,23 @@ export default function App() {
 
   const [driver, setDriver] = useState(saved?.driver || null);
   const [opsTrip, setOpsTrip] = useState(null);
+  const [seen, setSeen] = useState(loadSeen());
+  const [bellOpen, setBellOpen] = useState(false);
+  const notifiedRef = useRef(Date.now());
+
+  useEffect(() => {
+    const fresh = (data.announcements || []).filter(a => a.at > notifiedRef.current);
+    if (fresh.length) {
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        fresh.forEach(a => { try { new Notification(a.priority === "urgent" ? "\u26a0 " + a.title : a.title, { body: a.body }); } catch {} });
+      }
+      notifiedRef.current = Math.max(notifiedRef.current, ...fresh.map(a => a.at));
+    }
+  }, [data.announcements]);
+
+  useEffect(() => {
+    if (session && (data.announcements || []).some(a => a.at > seen)) setBellOpen(true);
+  }, [data.announcements, seen, session]);
 
   const signIn = (s) => { setSession(s); if (s.role === "driver") setDriver(s.driver || null); persistSession(s); };
   const signOut = () => { setSession(null); setDriver(null); setOpsTrip(null); persistSession(null); };
@@ -428,13 +745,13 @@ export default function App() {
     (async () => {
       const d = await sget("avemel:data:v2");
       const f = await sget("avemel:fleet:v3");
-      setData(d ? { trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, updatedAt: d.updatedAt || 0 } : { trips: [], leave: [], payslips: {}, updatedAt: 0 });
+      setData(d ? { trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, faults: d.faults || [], announcements: d.announcements || [], updatedAt: d.updatedAt || 0 } : { trips: [], leave: [], payslips: {}, faults: [], announcements: [], updatedAt: 0 });
       if (f) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS }); else sset("avemel:fleet:v3", { ...SEED, rates: RATE_DEFAULTS, updatedAt: Date.now() });
       setReady(true);
     })();
     const iv = setInterval(async () => {
       const d = await sget("avemel:data:v2");
-      if (d && (d.updatedAt || 0) > dataRef.current.updatedAt) setData({ trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, updatedAt: d.updatedAt || 0 });
+      if (d && (d.updatedAt || 0) > dataRef.current.updatedAt) setData({ trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, faults: d.faults || [], announcements: d.announcements || [], updatedAt: d.updatedAt || 0 });
       const f = await sget("avemel:fleet:v3");
       if (f && (f.updatedAt || 0) > fleetRef.current.updatedAt) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS });
     }, 8000);
@@ -446,6 +763,26 @@ export default function App() {
   const addTrip = (t) => saveData({ ...dataRef.current, trips: [t, ...dataRef.current.trips] });
   const updTrip = (id, fn) => saveData({ ...dataRef.current, trips: dataRef.current.trips.map(t => t.id === id ? fn({ ...t }) : t) });
   const addLeave = (a) => saveData({ ...dataRef.current, leave: [a, ...(dataRef.current.leave || [])] });
+  const addFault = (f) => saveData({ ...dataRef.current, faults: [f, ...(dataRef.current.faults || [])] });
+  const clearFault = (id, by, note) => saveData({ ...dataRef.current, faults: (dataRef.current.faults || []).map(x => x.id === id ? { ...x, status: "cleared", clearedBy: by || "Workshop", clearedAt: Date.now(), clearNote: note || "" } : x) });
+  const addAnnouncement = (a) => { saveData({ ...dataRef.current, announcements: [a, ...(dataRef.current.announcements || [])] }); try { if (window.avemelSendPush) window.avemelSendPush(a); } catch {} };
+  const removeAnnouncement = (id) => saveData({ ...dataRef.current, announcements: (dataRef.current.announcements || []).filter(a => a.id !== id) });
+  const submitChecklist = (id, checklist) => {
+    const cur = dataRef.current;
+    const trip = cur.trips.find(t => t.id === id);
+    const newFaults = (checklist.defects || []).map(d => ({
+      id: uid(), vehicle: trip?.vehicle || "", severity: d.critical ? "Critical" : "Major",
+      desc: `Pre-trip checklist: ${d.label}${d.note ? ` - ${d.note}` : ""}`,
+      reportedBy: trip?.driver || "Driver", reportedAt: Date.now(), status: "open", source: "checklist", tripId: id,
+    }));
+    const n = (checklist.defects || []).length;
+    saveData({
+      ...cur,
+      trips: cur.trips.map(t => t.id === id ? { ...t, status: "checklist_done", checklist,
+        timeline: [...t.timeline, { e: `Pre-trip checklist completed${n ? ` \u2013 ${n} defect(s) logged, vehicle flagged to workshop` : " \u2013 all clear"}`, ts: Date.now() }] } : t),
+      faults: [...newFaults, ...(cur.faults || [])],
+    });
+  };
   const decideLeave = (id, approve, approver) => {
     const app = (dataRef.current.leave || []).find(l => l.id === id);
     saveData({ ...dataRef.current, leave: dataRef.current.leave.map(l => l.id === id ? { ...l, status: approve ? "approved" : "declined", decidedBy: approver || "Management", decidedAt: Date.now() } : l) });
@@ -482,16 +819,27 @@ export default function App() {
   if (!ready) return <div className="p-8 text-center text-gray-400">Loading\u2026</div>;
 
   const role = session?.role;
-  const roleLabel = !session ? "" : { driver: "Driver App", ops: "Control Room", admin: "Admin & Payroll" }[role];
+  const roleLabel = !session ? "" : { driver: "Driver App", ops: "Control Room", admin: "Admin & Payroll", workshop: "Workshop" }[role];
+  const unread = (data.announcements || []).filter(a => a.at > seen).length;
+  const openBell = () => setBellOpen(true);
+  const closeBell = () => { setBellOpen(false); const now = Date.now(); setSeen(now); saveSeen(now); };
 
   return (
     <div className="max-w-md mx-auto min-h-screen" style={{ background: "#f4f4f5", fontFamily: "system-ui, sans-serif" }}>
       <div className="flex items-center justify-between px-4 py-3 bg-white border-b" style={{ borderColor: "#e5e5e5" }}>
         <img src={LOGO} alt="Avemel - The Leader in Logistics" className="h-9 w-auto" />
-        {session
-          ? <button onClick={signOut} className="text-xs font-semibold underline" style={{ color: RED }}>Sign out</button>
-          : <span className="text-xs font-semibold" style={{ color: "#9a9a9a" }}>Sign in</span>}
+        {session ? (
+          <div className="flex items-center gap-4">
+            <button onClick={openBell} className="relative" aria-label="Announcements" style={{ fontSize: 20, lineHeight: 1 }}>
+              {"\uD83D\uDD14"}
+              {unread > 0 && <span className="absolute -top-1.5 -right-1.5 text-[9px] font-bold text-white rounded-full flex items-center justify-center" style={{ background: RED, minWidth: 15, height: 15, padding: "0 3px" }}>{unread}</span>}
+            </button>
+            <button onClick={signOut} className="text-xs font-semibold underline" style={{ color: RED }}>Sign out</button>
+          </div>
+        ) : <span className="text-xs font-semibold" style={{ color: "#9a9a9a" }}>Sign in</span>}
       </div>
+
+      {bellOpen && <AnnouncementsPanel announcements={data.announcements || []} seen={seen} onClose={closeBell} />}
 
       {!session ? (
         <div className="px-4 py-6"><LoginGate signIn={signIn} /></div>
@@ -502,9 +850,10 @@ export default function App() {
             {role === "driver" && driver && <span className="text-xs text-gray-400">{driver}</span>}
           </div>
           <div className="px-4 pb-4 pt-2">
-            {role === "driver" && <DriverView {...{ driver, setDriver: setDriverPersist, fleet, data, activeTrip, addTrip, updTrip, saveFleet, addLeave }} />}
+            {role === "driver" && <DriverView {...{ driver, setDriver: setDriverPersist, fleet, data, activeTrip, addTrip, updTrip, saveFleet, addLeave, addFault, submitChecklist }} />}
             {role === "ops" && <OpsView {...{ data, fleet, updTrip, saveFleet, opsTrip, setOpsTrip, approvePod }} />}
-            {role === "admin" && <AdminView {...{ data, fleet, rates, updTrip, decideLeave, saveBalances, savePayslip, saveRates, saveTenure }} />}
+            {role === "admin" && <AdminView {...{ data, fleet, rates, updTrip, decideLeave, saveBalances, savePayslip, saveRates, saveTenure, addAnnouncement, removeAnnouncement }} />}
+            {role === "workshop" && <WorkshopView {...{ data, fleet, addFault, clearFault }} />}
           </div>
         </>
       )}
@@ -513,7 +862,7 @@ export default function App() {
 }
 
 // ============ DRIVER ============
-function DriverView({ driver, setDriver, fleet, data, activeTrip, addTrip, updTrip, saveFleet, addLeave }) {
+function DriverView({ driver, setDriver, fleet, data, activeTrip, addTrip, updTrip, saveFleet, addLeave, addFault, submitChecklist }) {
   const [newName, setNewName] = useState("");
   const [tab, setTab] = useState("trip");
 
@@ -538,6 +887,7 @@ function DriverView({ driver, setDriver, fleet, data, activeTrip, addTrip, updTr
   }
 
   const myPending = (data.leave || []).filter(l => l.driver === driver && l.status === "pending").length;
+  const myOpenFaults = (data.faults || []).filter(f => f.reportedBy === driver && f.status === "open").length;
 
   return (
     <div>
@@ -545,10 +895,12 @@ function DriverView({ driver, setDriver, fleet, data, activeTrip, addTrip, updTr
         <div><div className="text-xs text-gray-400">Driver</div><div className="font-bold" style={{ color: DARK }}>{driver}</div></div>
         <button onClick={() => setDriver(null)} className="text-xs underline text-gray-500">Switch</button>
       </div>
-      <Tabs value={tab} onChange={setTab} tabs={[{ k: "trip", label: "My Trip" }, { k: "leave", label: "Leave", badge: myPending || null }]} />
+      <Tabs value={tab} onChange={setTab} tabs={[{ k: "trip", label: "My Trip" }, { k: "leave", label: "Leave", badge: myPending || null }, { k: "faults", label: "Faults", badge: myOpenFaults || null }]} />
       {tab === "trip"
-        ? (!activeTrip ? <AssignStep {...{ driver, fleet, addTrip }} /> : <TripFlow {...{ trip: activeTrip, updTrip }} />)
-        : <LeaveDriver {...{ driver, fleet, data, addLeave }} />}
+        ? (!activeTrip ? <AssignStep {...{ driver, fleet, addTrip, data }} /> : <TripFlow {...{ trip: activeTrip, updTrip, submitChecklist }} />)
+        : tab === "leave"
+        ? <LeaveDriver {...{ driver, fleet, data, addLeave }} />
+        : <FaultReport {...{ driver, fleet, data, activeTrip, addFault }} />}
     </div>
   );
 }
@@ -628,8 +980,9 @@ function LeaveDriver({ driver, fleet, data, addLeave }) {
   );
 }
 
-function AssignStep({ driver, fleet, addTrip }) {
+function AssignStep({ driver, fleet, addTrip, data }) {
   const [v, setV] = useState("");
+  const faulted = faultedRegs(data);
   const [tt, setTt] = useState("");
   const [trailers, setTrailers] = useState([]);
   const [pickT, setPickT] = useState("");
@@ -645,10 +998,12 @@ function AssignStep({ driver, fleet, addTrip }) {
       <h3 className="font-bold mb-3" style={{ color: DARK }}>Assign your combination</h3>
 
       <label className="text-xs font-semibold text-gray-500">Truck</label>
-      <select value={v} onChange={e => setV(e.target.value)} className="w-full mt-1 mb-3 px-3 py-2 rounded-lg border" style={{ borderColor: "#ddd" }}>
+      <select value={v} onChange={e => setV(e.target.value)} className="w-full mt-1 mb-1 px-3 py-2 rounded-lg border" style={{ borderColor: "#ddd" }}>
         <option value="">Select truck\u2026</option>
-        {fleet.vehicles.map(x => <option key={x.reg} value={x.reg}>{x.reg} \u2014 {x.make}</option>)}
+        {fleet.vehicles.map(x => { const down = faulted.has(x.reg); return <option key={x.reg} value={x.reg} disabled={down}>{x.reg} \u2014 {x.make}{down ? " (in workshop)" : ""}</option>; })}
       </select>
+      {faulted.size > 0 && <div className="text-[11px] mb-3" style={{ color: RED }}>{faulted.size} vehicle(s) are in the workshop and can't be selected until cleared.</div>}
+      {faulted.size === 0 && <div className="mb-3" />}
 
       <label className="text-xs font-semibold text-gray-500">Trailer type</label>
       <select value={tt} onChange={e => setTt(e.target.value)} className="w-full mt-1 mb-3 px-3 py-2 rounded-lg border" style={{ borderColor: "#ddd" }}>
@@ -682,8 +1037,8 @@ function AssignStep({ driver, fleet, addTrip }) {
   );
 }
 
-function TripFlow({ trip, updTrip }) {
-  if (trip.status === "assigned") return <ChecklistStep {...{ trip, updTrip }} />;
+function TripFlow({ trip, updTrip, submitChecklist }) {
+  if (trip.status === "assigned") return <ChecklistStep {...{ trip, submitChecklist }} />;
   if (trip.status === "checklist_done") return <AwaitStep {...{ trip, updTrip }} />;
   if (trip.status === "awaiting") return <AwaitNextStep {...{ trip, updTrip }} />;
   return <RunStep {...{ trip, updTrip }} />;
@@ -704,7 +1059,7 @@ function AwaitNextStep({ trip, updTrip }) {
   );
 }
 
-function ChecklistStep({ trip, updTrip }) {
+function ChecklistStep({ trip, submitChecklist }) {
   const [ans, setAns] = useState({});
   const [photos, setPhotos] = useState({});
   const set = (id, patch) => setAns(a => ({ ...a, [id]: { ...a[id], ...patch } }));
@@ -717,9 +1072,7 @@ function ChecklistStep({ trip, updTrip }) {
   const complete = () => {
     const defects = ALL_ITEMS.filter(i => ans[i.id]?.status === "fail")
       .map(i => ({ id: i.id, label: i.label, critical: i.critical, note: ans[i.id].note }));
-    updTrip(trip.id, t => ({ ...t, status: "checklist_done",
-      checklist: { items: ans, defects, vehiclePhotos: photos, criticalFail: defects.some(d => d.critical), completedAt: Date.now() },
-      timeline: [...t.timeline, { e: `Pre-trip checklist completed${defects.length ? ` \u2013 ${defects.length} defect(s) logged` : " \u2013 all clear"}`, ts: Date.now() }] }));
+    submitChecklist(trip.id, { items: ans, defects, vehiclePhotos: photos, criticalFail: defects.some(d => d.critical), completedAt: Date.now() });
   };
 
   return (
@@ -964,7 +1317,7 @@ function OpsView({ data, fleet, updTrip, saveFleet, opsTrip, setOpsTrip, approve
   );
 }
 
-function AdminView({ data, fleet, rates, updTrip, decideLeave, saveBalances, savePayslip, saveRates, saveTenure }) {
+function AdminView({ data, fleet, rates, updTrip, decideLeave, saveBalances, savePayslip, saveRates, saveTenure, addAnnouncement, removeAnnouncement }) {
   const [tab, setTab] = useState("leave");
   const [priceId, setPriceId] = useState(null);
   const sel = priceId ? data.trips.find(t => t.id === priceId) : null;
@@ -978,9 +1331,11 @@ function AdminView({ data, fleet, rates, updTrip, decideLeave, saveBalances, sav
       <Tabs value={tab} onChange={setTab} tabs={[
         { k: "leave", label: "Leave", badge: pendingLeave || null },
         { k: "payroll", label: "Payroll", badge: toPrice || null },
+        { k: "announce", label: "Announce" },
       ]} />
       {tab === "leave" && <LeaveOps {...{ data, fleet, decideLeave, saveBalances }} />}
       {tab === "payroll" && <WagesOps {...{ data, rates, setPriceTrip: setPriceId, savePayslip, saveRates }} />}
+      {tab === "announce" && <AnnounceCompose {...{ data, addAnnouncement, removeAnnouncement }} />}
     </div>
   );
 }
@@ -1139,6 +1494,7 @@ function WagesOps({ data, rates, setPriceTrip, savePayslip, saveRates }) {
           {(months.length ? months : [ym]).map(m => <option key={m} value={m}>{monthLabel(m)}</option>)}
         </select>
       </div>
+      <button onClick={() => exportLoads(data.trips, ym)} className="w-full mb-3 py-2.5 rounded-lg font-bold text-white" style={{ background: DARK }}>Export loads to Excel ({monthLabel(ym)})</button>
       <h3 className="font-bold mb-2" style={{ color: DARK }}>Driver wages</h3>
       {drivers.length === 0 && <div className="text-sm text-gray-400 bg-white rounded-xl p-4 border" style={{ borderColor: "#e5e5e5" }}>No trips logged this month.</div>}
       <div className="space-y-2">
@@ -1720,6 +2076,42 @@ function PodCard({ trip, updTrip, approve }) {
   );
 }
 
+function FinalizeCard({ trip, updTrip }) {
+  const fin = trip.finalized;
+  const [pod, setPod] = useState(false);
+  const [sheet, setSheet] = useState(false);
+  const [by, setBy] = useState("");
+
+  const finalize = () => {
+    updTrip(trip.id, t => ({ ...t, finalized: { pod: true, sheet: true, by: by || "Admin", at: Date.now() },
+      timeline: [...t.timeline, { e: `Trip finalised - original POD & trip sheet handed in (${by || "Admin"})`, ts: Date.now() }] }));
+  };
+
+  return (
+    <div className="bg-white rounded-xl p-3 border shadow-sm mb-3" style={{ borderColor: fin ? "#0a7d3f" : RED }}>
+      <div className="font-bold text-sm mb-2" style={{ color: DARK }}>Finalise trip</div>
+      {fin ? (
+        <div className="text-xs rounded-lg p-2" style={{ background: "#eafaf0", color: "#0a7d3f" }}>
+          Finalised by {fin.by} {"\u00b7"} {fmt(fin.at)}
+          <div className="mt-0.5">Original POD and trip sheet handed in {"\u2713"}</div>
+        </div>
+      ) : (
+        <>
+          <div className="text-xs text-gray-500 mb-2">Confirm the physical paperwork is in before closing this trip off.</div>
+          <label className="flex items-center gap-2 mb-2 text-sm" style={{ color: DARK }}>
+            <input type="checkbox" checked={pod} onChange={e => setPod(e.target.checked)} /> Original POD handed in
+          </label>
+          <label className="flex items-center gap-2 mb-3 text-sm" style={{ color: DARK }}>
+            <input type="checkbox" checked={sheet} onChange={e => setSheet(e.target.checked)} /> Trip sheet handed in
+          </label>
+          <input value={by} onChange={e => setBy(e.target.value)} placeholder="Finalised by" className="w-full px-3 py-2 rounded-lg border text-sm mb-2" style={{ borderColor: "#ddd" }} />
+          <button disabled={!pod || !sheet} onClick={finalize} className="w-full py-3 rounded-xl font-bold text-white disabled:opacity-40" style={{ background: "#0a7d3f" }}>Finalise trip</button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function PriceTrip({ trip, updTrip, fleet, rates, saveTenure, back }) {
   return (
     <div>
@@ -1747,6 +2139,8 @@ function PriceTrip({ trip, updTrip, fleet, rates, saveTenure, back }) {
       {trip.status === "closed"
         ? <PayCard {...{ trip, updTrip, fleet, rates, saveTenure }} />
         : <div className="bg-white rounded-xl p-4 border shadow-sm text-sm text-gray-500" style={{ borderColor: RED }}>Wages can be priced once the POD has been approved under POD Approvals.</div>}
+
+      {trip.status === "closed" && trip.pay?.status === "approved" && <FinalizeCard {...{ trip, updTrip }} />}
 
       <Timeline t={trip} />
     </div>
