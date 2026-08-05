@@ -7,7 +7,9 @@ Flat layout (all code at the top level) so GitHub web uploads can't nest files w
 - Operations - PIN: Avemel26
 - HR & Payroll - PIN: Avemel27
 - Workshop - PIN: Avemel28
-- Admin (back office: add/remove drivers, set driver passwords) - PIN: 2418
+- Admin (back office) - PIN: 2418
+  Two tabs: Drivers (add/remove drivers, set passwords) and Fleet list
+  (add/remove trucks & trailers, see live availability).
 Change PINs in App.jsx (OPS_PIN / ADMIN_PIN / WORKSHOP_PIN / BACKEND_PIN).
 
 Drivers only ever see their own trips, leave and faults. A driver can't log in

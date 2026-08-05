@@ -146,6 +146,19 @@ const FAULT_SEV = ["Minor", "Major", "Critical"];
 const FAULT_SEV_COLOR = { Minor: "#b58100", Major: "#d2691e", Critical: "#b00020" };
 // Vehicle regs that currently have an unresolved workshop fault.
 const faultedRegs = (data) => new Set((data.faults || []).filter(f => f.status === "open").map(f => f.vehicle));
+// Trucks/trailers currently committed to a live (non-closed) trip.
+const inUseRigs = (data) => {
+  const veh = new Set(), trl = new Set();
+  (data.trips || []).filter(t => t.status !== "closed").forEach(t => {
+    if (t.vehicle) veh.add(t.vehicle);
+    (t.trailers || []).forEach(r => trl.add(r));
+  });
+  return { veh, trl };
+};
+const rigUser = (data, reg, isTrailer) => {
+  const t = (data.trips || []).find(x => x.status !== "closed" && (isTrailer ? (x.trailers || []).includes(reg) : x.vehicle === reg));
+  return t ? t.driver : null;
+};
 // Session persists only in the deployed build (window.authStore). In the Claude
 // preview it stays in memory, so you sign in again after a full reload.
 const SESSION_STORE = (typeof window !== "undefined" && window.authStore) ? window.authStore : null;
@@ -663,7 +676,7 @@ function AnnounceCompose({ data, addAnnouncement, removeAnnouncement }) {
   );
 }
 
-function BackendAdmin({ fleet, saveFleet }) {
+function DriversAdmin({ fleet, saveFleet }) {
   const auth = fleet.driverAuth || {};
   const [name, setName] = useState("");
   const [pass, setPass] = useState("");
@@ -716,6 +729,88 @@ function BackendAdmin({ fleet, saveFleet }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function BackendAdmin({ fleet, saveFleet, data }) {
+  const [tab, setTab] = useState("drivers");
+  return (
+    <div>
+      <Tabs value={tab} onChange={setTab} tabs={[{ k: "drivers", label: "Drivers" }, { k: "fleet", label: "Fleet list" }]} />
+      {tab === "drivers" ? <DriversAdmin {...{ fleet, saveFleet }} /> : <FleetManage {...{ fleet, saveFleet, data }} />}
+    </div>
+  );
+}
+
+function StatusTag({ reg, isTrailer, data }) {
+  const faulted = faultedRegs(data);
+  if (!isTrailer && faulted.has(reg)) return <span className="text-[10px] font-bold px-2 py-0.5 rounded-full text-white" style={{ background: "#b00020" }}>In workshop</span>;
+  const user = rigUser(data, reg, isTrailer);
+  if (user) return <span className="text-[10px] font-bold px-2 py-0.5 rounded-full" style={{ background: "#eef4ff", color: "#0b69c7" }}>In use {"\u00b7"} {user}</span>;
+  return <span className="text-[10px] font-bold px-2 py-0.5 rounded-full" style={{ background: "#eafaf0", color: "#0a7d3f" }}>Available</span>;
+}
+
+function FleetManage({ fleet, saveFleet, data }) {
+  const [vr, setVr] = useState(""); const [vm, setVm] = useState(""); const [tr, setTr] = useState("");
+  const { veh, trl } = inUseRigs(data);
+  const availTrucks = fleet.vehicles.filter(x => !veh.has(x.reg) && !faultedRegs(data).has(x.reg)).length;
+  const availTrailers = fleet.trailers.filter(x => !trl.has(x.reg)).length;
+
+  const addTruck = () => { const reg = vr.trim(); if (!reg) return; if (fleet.vehicles.some(x => x.reg === reg)) { alert("That reg already exists."); return; } saveFleet({ ...fleet, vehicles: [...fleet.vehicles, { reg, make: vm.trim() }] }); setVr(""); setVm(""); };
+  const addTrailer = () => { const reg = tr.trim(); if (!reg) return; if (fleet.trailers.some(x => x.reg === reg)) { alert("That reg already exists."); return; } saveFleet({ ...fleet, trailers: [...fleet.trailers, { reg }] }); setTr(""); };
+  const rmTruck = (reg) => { if (typeof confirm !== "undefined" && !confirm(`Remove truck ${reg}?`)) return; saveFleet({ ...fleet, vehicles: fleet.vehicles.filter(x => x.reg !== reg) }); };
+  const rmTrailer = (reg) => { if (typeof confirm !== "undefined" && !confirm(`Remove trailer ${reg}?`)) return; saveFleet({ ...fleet, trailers: fleet.trailers.filter(x => x.reg !== reg) }); };
+
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-2 mb-4">
+        <Stat n={`${availTrucks}/${fleet.vehicles.length}`} l="Trucks free" />
+        <Stat n={`${availTrailers}/${fleet.trailers.length}`} l="Trailers free" />
+      </div>
+
+      <div className="bg-white rounded-xl p-4 border shadow-sm mb-3" style={{ borderColor: "#e5e5e5" }}>
+        <h3 className="font-bold mb-2" style={{ color: DARK }}>Add truck</h3>
+        <div className="flex gap-2">
+          <input value={vr} onChange={e => setVr(e.target.value)} placeholder="Reg" className="w-1/3 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+          <input value={vm} onChange={e => setVm(e.target.value)} placeholder="Make / model" className="flex-1 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+          <button onClick={addTruck} disabled={!vr.trim()} className="px-4 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: RED }}>Add</button>
+        </div>
+      </div>
+
+      <h3 className="font-bold mb-2" style={{ color: DARK }}>Trucks</h3>
+      <div className="space-y-2 mb-5">
+        {fleet.vehicles.map(x => (
+          <div key={x.reg} className="bg-white rounded-xl p-3 border shadow-sm flex justify-between items-center" style={{ borderColor: "#e5e5e5" }}>
+            <div><div className="font-bold" style={{ color: DARK }}>{x.reg}</div><div className="text-xs text-gray-500">{x.make}</div></div>
+            <div className="flex items-center gap-3">
+              <StatusTag reg={x.reg} isTrailer={false} data={data} />
+              <button onClick={() => rmTruck(x.reg)} className="text-xs underline text-gray-400">Remove</button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="bg-white rounded-xl p-4 border shadow-sm mb-3" style={{ borderColor: "#e5e5e5" }}>
+        <h3 className="font-bold mb-2" style={{ color: DARK }}>Add trailer</h3>
+        <div className="flex gap-2">
+          <input value={tr} onChange={e => setTr(e.target.value)} placeholder="Reg" className="flex-1 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+          <button onClick={addTrailer} disabled={!tr.trim()} className="px-4 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: RED }}>Add</button>
+        </div>
+      </div>
+
+      <h3 className="font-bold mb-2" style={{ color: DARK }}>Trailers</h3>
+      <div className="space-y-2">
+        {fleet.trailers.map(x => (
+          <div key={x.reg} className="bg-white rounded-xl p-3 border shadow-sm flex justify-between items-center" style={{ borderColor: "#e5e5e5" }}>
+            <div className="font-bold" style={{ color: DARK }}>{x.reg}</div>
+            <div className="flex items-center gap-3">
+              <StatusTag reg={x.reg} isTrailer={true} data={data} />
+              <button onClick={() => rmTrailer(x.reg)} className="text-xs underline text-gray-400">Remove</button>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -940,7 +1035,7 @@ export default function App() {
             {role === "ops" && <OpsView {...{ data, fleet, updTrip, saveFleet, opsTrip, setOpsTrip, approvePod }} />}
             {role === "admin" && <AdminView {...{ data, fleet, rates, updTrip, decideLeave, saveBalances, savePayslip, saveRates, saveTenure, addAnnouncement, removeAnnouncement }} />}
             {role === "workshop" && <WorkshopView {...{ data, fleet, addFault, clearFault }} />}
-            {role === "backend" && <BackendAdmin {...{ fleet, saveFleet }} />}
+            {role === "backend" && <BackendAdmin {...{ fleet, saveFleet, data }} />}
           </div>
         </>
       )}
@@ -1052,11 +1147,13 @@ function LeaveDriver({ driver, fleet, data, addLeave }) {
 function AssignStep({ driver, fleet, addTrip, data }) {
   const [v, setV] = useState("");
   const faulted = faultedRegs(data);
+  const { veh: inVeh, trl: inTrl } = inUseRigs(data);
   const [tt, setTt] = useState("");
   const [trailers, setTrailers] = useState([]);
   const [pickT, setPickT] = useState("");
   const addTrailer = () => { if (pickT && !trailers.includes(pickT)) { setTrailers([...trailers, pickT]); setPickT(""); } };
   const go = () => {
+    if (inVeh.has(v) || trailers.some(r => inTrl.has(r))) return; // safety: already taken
     addTrip({ id: uid(), driver, vehicle: v, trailerType: tt, trailers, status: "assigned",
       checklist: null, instruction: null, requested: false, pods: [], loadPhotos: [], signature: null, receiver: "", pay: null,
       timeline: [{ e: `Trip started \u2013 ${v} / ${tt}${trailers.length ? " (" + trailers.join(", ") + ")" : ""} assigned`, ts: Date.now() }], createdAt: Date.now() });
@@ -1069,10 +1166,9 @@ function AssignStep({ driver, fleet, addTrip, data }) {
       <label className="text-xs font-semibold text-gray-500">Truck</label>
       <select value={v} onChange={e => setV(e.target.value)} className="w-full mt-1 mb-1 px-3 py-2 rounded-lg border" style={{ borderColor: "#ddd" }}>
         <option value="">Select truck\u2026</option>
-        {fleet.vehicles.map(x => { const down = faulted.has(x.reg); return <option key={x.reg} value={x.reg} disabled={down}>{x.reg} \u2014 {x.make}{down ? " (in workshop)" : ""}</option>; })}
+        {fleet.vehicles.map(x => { const down = faulted.has(x.reg); const busy = inVeh.has(x.reg); const off = down || busy; return <option key={x.reg} value={x.reg} disabled={off}>{x.reg} \u2014 {x.make}{down ? " (in workshop)" : busy ? " (in use)" : ""}</option>; })}
       </select>
-      {faulted.size > 0 && <div className="text-[11px] mb-3" style={{ color: RED }}>{faulted.size} vehicle(s) are in the workshop and can't be selected until cleared.</div>}
-      {faulted.size === 0 && <div className="mb-3" />}
+      {(faulted.size > 0 || inVeh.size > 0) ? <div className="text-[11px] mb-3" style={{ color: RED }}>Greyed trucks are in the workshop or already in use by another driver.</div> : <div className="mb-3" />}
 
       <label className="text-xs font-semibold text-gray-500">Trailer type</label>
       <select value={tt} onChange={e => setTt(e.target.value)} className="w-full mt-1 mb-3 px-3 py-2 rounded-lg border" style={{ borderColor: "#ddd" }}>
@@ -1085,10 +1181,11 @@ function AssignStep({ driver, fleet, addTrip, data }) {
       <div className="flex gap-2 mt-1">
         <select value={pickT} onChange={e => setPickT(e.target.value)} className="flex-1 px-3 py-2 rounded-lg border" style={{ borderColor: "#ddd" }}>
           <option value="">Select unit\u2026</option>
-          {fleet.trailers.filter(x => !trailers.includes(x.reg)).map(x => <option key={x.reg} value={x.reg}>{x.reg}</option>)}
+          {fleet.trailers.filter(x => !trailers.includes(x.reg) && !inTrl.has(x.reg)).map(x => <option key={x.reg} value={x.reg}>{x.reg}</option>)}
         </select>
         <button onClick={addTrailer} disabled={!pickT} className="px-4 rounded-lg text-white font-semibold disabled:opacity-40" style={{ background: DARK }}>Add</button>
       </div>
+      {inTrl.size > 0 && <div className="text-[11px] text-gray-400 mt-1">Trailers already in use by other drivers are hidden.</div>}
       {trailers.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mt-2">
           {trailers.map(r => (
