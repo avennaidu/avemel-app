@@ -141,6 +141,7 @@ const LEG_LABEL = { import: "Imports", export: "Exports", local: "Local" };
 const OPS_PIN = "Avemel26";
 const ADMIN_PIN = "Avemel27";
 const WORKSHOP_PIN = "Avemel28";
+const BACKEND_PIN = "2418";
 const FAULT_SEV = ["Minor", "Major", "Critical"];
 const FAULT_SEV_COLOR = { Minor: "#b58100", Major: "#d2691e", Critical: "#b00020" };
 // Vehicle regs that currently have an unresolved workshop fault.
@@ -662,36 +663,121 @@ function AnnounceCompose({ data, addAnnouncement, removeAnnouncement }) {
   );
 }
 
-function LoginGate({ signIn }) {
+function BackendAdmin({ fleet, saveFleet }) {
+  const auth = fleet.driverAuth || {};
+  const [name, setName] = useState("");
+  const [pass, setPass] = useState("");
+  const [edits, setEdits] = useState({});
+
+  const addDriver = () => {
+    const n = name.trim(); if (!n) return;
+    if (fleet.drivers.includes(n)) { alert("That driver already exists."); return; }
+    saveFleet({ ...fleet, drivers: [...fleet.drivers, n].sort((a, b) => a.localeCompare(b)), driverAuth: { ...auth, [n]: pass.trim() } });
+    setName(""); setPass("");
+  };
+  const savePassword = (n) => saveFleet({ ...fleet, driverAuth: { ...auth, [n]: (edits[n] !== undefined ? edits[n] : (auth[n] || "")).trim() } });
+  const removeDriver = (n) => {
+    if (typeof confirm !== "undefined" && !confirm(`Remove ${n}? They won't be able to log in.`)) return;
+    const na = { ...auth }; delete na[n];
+    saveFleet({ ...fleet, drivers: fleet.drivers.filter(x => x !== n), driverAuth: na });
+  };
+
+  const withPass = fleet.drivers.filter(d => auth[d]).length;
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-2 mb-4">
+        <Stat n={fleet.drivers.length} l="Drivers" />
+        <Stat n={fleet.drivers.length - withPass} l="No password" hot={fleet.drivers.length - withPass > 0} />
+      </div>
+
+      <div className="bg-white rounded-xl p-4 border shadow-sm mb-4" style={{ borderColor: "#e5e5e5" }}>
+        <h3 className="font-bold mb-2" style={{ color: DARK }}>Add driver</h3>
+        <input value={name} onChange={e => setName(e.target.value)} placeholder="Full name" className="w-full mb-2 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+        <input value={pass} onChange={e => setPass(e.target.value)} placeholder="Login password" className="w-full mb-3 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+        <button disabled={!name.trim()} onClick={addDriver} className="w-full py-3 rounded-xl font-bold text-white disabled:opacity-40" style={{ background: RED }}>Add driver</button>
+      </div>
+
+      <h3 className="font-bold mb-2" style={{ color: DARK }}>Drivers &amp; passwords</h3>
+      <p className="text-xs text-gray-500 mb-2">Set each driver's login password. Drivers only ever see their own trips, leave and faults.</p>
+      <div className="space-y-2">
+        {fleet.drivers.map(d => {
+          const val = edits[d] !== undefined ? edits[d] : (auth[d] || "");
+          return (
+            <div key={d} className="bg-white rounded-xl p-3 border shadow-sm" style={{ borderColor: auth[d] ? "#e5e5e5" : RED }}>
+              <div className="flex justify-between items-center mb-2">
+                <div className="font-bold" style={{ color: DARK }}>{d}</div>
+                <button onClick={() => removeDriver(d)} className="text-xs underline text-gray-400">Remove</button>
+              </div>
+              <div className="flex gap-2">
+                <input value={val} onChange={e => setEdits(s => ({ ...s, [d]: e.target.value }))} placeholder="Set password" className="flex-1 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
+                <button onClick={() => savePassword(d)} className="px-4 rounded-lg text-white text-sm font-semibold" style={{ background: DARK }}>Save</button>
+              </div>
+              {!auth[d] && <div className="text-[11px] mt-1" style={{ color: RED }}>No password set - can't log in yet.</div>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function LoginGate({ signIn, fleet }) {
   const [mode, setMode] = useState("choose");
   const [pin, setPin] = useState("");
   const [err, setErr] = useState("");
+  const [dName, setDName] = useState("");
+  const [dPass, setDPass] = useState("");
   const card = "w-full text-left px-4 py-4 rounded-xl bg-white border shadow-sm font-semibold flex justify-between items-center";
 
   if (mode === "choose") {
+    const opt = (m, label, sub) => (
+      <button onClick={() => { setMode(m); setPin(""); setErr(""); }} className={card} style={{ borderColor: "#e5e5e5" }}>
+        <span>{label}<span className="block text-xs font-normal text-gray-400">{sub}</span></span><span style={{ color: RED }}>{"\u203a"}</span>
+      </button>
+    );
     return (
       <div>
         <h2 className="text-lg font-bold mb-1" style={{ color: DARK }}>Sign in</h2>
         <p className="text-sm text-gray-500 mb-4">Choose how you're signing in.</p>
         <div className="space-y-2">
-          <button onClick={() => signIn({ role: "driver", driver: null })} className={card} style={{ borderColor: "#e5e5e5" }}>
-            <span>Driver<span className="block text-xs font-normal text-gray-400">Start your shift</span></span><span style={{ color: RED }}>{"\u203a"}</span>
+          <button onClick={() => { setMode("driver"); setDName(""); setDPass(""); setErr(""); }} className={card} style={{ borderColor: "#e5e5e5" }}>
+            <span>Driver<span className="block text-xs font-normal text-gray-400">Name &amp; password</span></span><span style={{ color: RED }}>{"\u203a"}</span>
           </button>
-          <button onClick={() => { setMode("ops"); setPin(""); setErr(""); }} className={card} style={{ borderColor: "#e5e5e5" }}>
-            <span>Operations<span className="block text-xs font-normal text-gray-400">Control room - PIN required</span></span><span style={{ color: RED }}>{"\u203a"}</span>
-          </button>
-          <button onClick={() => { setMode("admin"); setPin(""); setErr(""); }} className={card} style={{ borderColor: "#e5e5e5" }}>
-            <span>Admin &amp; Payroll<span className="block text-xs font-normal text-gray-400">PIN required</span></span><span style={{ color: RED }}>{"\u203a"}</span>
-          </button>
-          <button onClick={() => { setMode("workshop"); setPin(""); setErr(""); }} className={card} style={{ borderColor: "#e5e5e5" }}>
-            <span>Workshop<span className="block text-xs font-normal text-gray-400">Fault clearing - PIN required</span></span><span style={{ color: RED }}>{"\u203a"}</span>
-          </button>
+          {opt("ops", "Operations", "Control room - PIN required")}
+          {opt("admin", "HR & Payroll", "PIN required")}
+          {opt("workshop", "Workshop", "Fault clearing - PIN required")}
+          {opt("backend", "Admin", "Back office - PIN required")}
         </div>
       </div>
     );
   }
 
-  const META = { ops: { label: "Operations", pin: OPS_PIN }, admin: { label: "Admin & Payroll", pin: ADMIN_PIN }, workshop: { label: "Workshop", pin: WORKSHOP_PIN } };
+  if (mode === "driver") {
+    const auth = fleet.driverAuth || {};
+    const submitDriver = () => {
+      if (!dName) { setErr("Select your name."); return; }
+      if (!auth[dName]) { setErr("No password set for you yet. Ask the office."); return; }
+      if (dPass !== auth[dName]) { setErr("Incorrect password."); return; }
+      signIn({ role: "driver", driver: dName });
+    };
+    return (
+      <div>
+        <button onClick={() => { setMode("choose"); setErr(""); }} className="text-xs underline text-gray-500 mb-3">{"\u2039"} Back</button>
+        <h2 className="text-lg font-bold mb-1" style={{ color: DARK }}>Driver sign in</h2>
+        <p className="text-sm text-gray-500 mb-4">Select your name and enter your password.</p>
+        <select value={dName} onChange={e => { setDName(e.target.value); setErr(""); }} className="w-full px-3 py-3 rounded-xl border text-sm mb-2" style={{ borderColor: "#ddd" }}>
+          <option value="">Select your name\u2026</option>
+          {fleet.drivers.map(d => <option key={d} value={d}>{d}</option>)}
+        </select>
+        <input type="password" value={dPass} onChange={e => { setDPass(e.target.value); setErr(""); }} onKeyDown={e => { if (e.key === "Enter") submitDriver(); }}
+          placeholder="Password" className="w-full px-3 py-3 rounded-xl border text-sm mb-2" style={{ borderColor: err ? RED : "#ddd" }} />
+        {err && <div className="text-xs mb-2" style={{ color: RED }}>{err}</div>}
+        <button onClick={submitDriver} disabled={!dName || !dPass} className="w-full py-3 rounded-xl font-bold text-white disabled:opacity-40" style={{ background: RED }}>Sign in</button>
+      </div>
+    );
+  }
+
+  const META = { ops: { label: "Operations", pin: OPS_PIN }, admin: { label: "HR & Payroll", pin: ADMIN_PIN }, workshop: { label: "Workshop", pin: WORKSHOP_PIN }, backend: { label: "Admin", pin: BACKEND_PIN } };
   const m = META[mode];
   const submit = () => { if (pin === m.pin) signIn({ role: mode, driver: null }); else setErr("Incorrect PIN. Try again."); };
   return (
@@ -712,7 +798,7 @@ export default function App() {
   const [session, setSession] = useState(saved);
   const [view, setView] = useState("driver");
   const [data, setData] = useState({ trips: [], leave: [], payslips: {}, faults: [], announcements: [], updatedAt: 0 });
-  const [fleet, setFleet] = useState({ ...SEED, rates: RATE_DEFAULTS, updatedAt: 0 });
+  const [fleet, setFleet] = useState({ ...SEED, rates: RATE_DEFAULTS, driverAuth: {}, updatedAt: 0 });
   const [ready, setReady] = useState(false);
   const dataRef = useRef(data); useEffect(() => { dataRef.current = data; }, [data]);
   const fleetRef = useRef(fleet); useEffect(() => { fleetRef.current = fleet; }, [fleet]);
@@ -746,14 +832,14 @@ export default function App() {
       const d = await sget("avemel:data:v2");
       const f = await sget("avemel:fleet:v3");
       setData(d ? { trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, faults: d.faults || [], announcements: d.announcements || [], updatedAt: d.updatedAt || 0 } : { trips: [], leave: [], payslips: {}, faults: [], announcements: [], updatedAt: 0 });
-      if (f) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS }); else sset("avemel:fleet:v3", { ...SEED, rates: RATE_DEFAULTS, updatedAt: Date.now() });
+      if (f) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS, driverAuth: f.driverAuth || {} }); else sset("avemel:fleet:v3", { ...SEED, rates: RATE_DEFAULTS, driverAuth: {}, updatedAt: Date.now() });
       setReady(true);
     })();
     const iv = setInterval(async () => {
       const d = await sget("avemel:data:v2");
       if (d && (d.updatedAt || 0) > dataRef.current.updatedAt) setData({ trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, faults: d.faults || [], announcements: d.announcements || [], updatedAt: d.updatedAt || 0 });
       const f = await sget("avemel:fleet:v3");
-      if (f && (f.updatedAt || 0) > fleetRef.current.updatedAt) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS });
+      if (f && (f.updatedAt || 0) > fleetRef.current.updatedAt) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS, driverAuth: f.driverAuth || {} });
     }, 8000);
     return () => clearInterval(iv);
   }, []);
@@ -819,7 +905,7 @@ export default function App() {
   if (!ready) return <div className="p-8 text-center text-gray-400">Loading\u2026</div>;
 
   const role = session?.role;
-  const roleLabel = !session ? "" : { driver: "Driver App", ops: "Control Room", admin: "Admin & Payroll", workshop: "Workshop" }[role];
+  const roleLabel = !session ? "" : { driver: "Driver App", ops: "Control Room", admin: "HR & Payroll", workshop: "Workshop", backend: "Admin" }[role];
   const unread = (data.announcements || []).filter(a => a.at > seen).length;
   const openBell = () => setBellOpen(true);
   const closeBell = () => { setBellOpen(false); const now = Date.now(); setSeen(now); saveSeen(now); };
@@ -842,7 +928,7 @@ export default function App() {
       {bellOpen && <AnnouncementsPanel announcements={data.announcements || []} seen={seen} onClose={closeBell} />}
 
       {!session ? (
-        <div className="px-4 py-6"><LoginGate signIn={signIn} /></div>
+        <div className="px-4 py-6"><LoginGate signIn={signIn} fleet={fleet} /></div>
       ) : (
         <>
           <div className="px-4 pt-3 flex items-center justify-between">
@@ -854,6 +940,7 @@ export default function App() {
             {role === "ops" && <OpsView {...{ data, fleet, updTrip, saveFleet, opsTrip, setOpsTrip, approvePod }} />}
             {role === "admin" && <AdminView {...{ data, fleet, rates, updTrip, decideLeave, saveBalances, savePayslip, saveRates, saveTenure, addAnnouncement, removeAnnouncement }} />}
             {role === "workshop" && <WorkshopView {...{ data, fleet, addFault, clearFault }} />}
+            {role === "backend" && <BackendAdmin {...{ fleet, saveFleet }} />}
           </div>
         </>
       )}
@@ -863,27 +950,10 @@ export default function App() {
 
 // ============ DRIVER ============
 function DriverView({ driver, setDriver, fleet, data, activeTrip, addTrip, updTrip, saveFleet, addLeave, addFault, submitChecklist }) {
-  const [newName, setNewName] = useState("");
   const [tab, setTab] = useState("trip");
 
   if (!driver) {
-    return (
-      <div>
-        <h2 className="text-lg font-bold mb-1" style={{ color: DARK }}>Who's driving?</h2>
-        <p className="text-sm text-gray-500 mb-4">Select your name to start your shift.</p>
-        <div className="space-y-2">
-          {fleet.drivers.map(d => (
-            <button key={d} onClick={() => setDriver(d)} className="w-full text-left px-4 py-3 rounded-xl bg-white border shadow-sm font-semibold flex justify-between items-center" style={{ borderColor: "#e5e5e5" }}>
-              {d} <span style={{ color: RED }}>{"\u203a"}</span>
-            </button>
-          ))}
-        </div>
-        <div className="mt-4 flex gap-2">
-          <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Add a driver" className="flex-1 px-3 py-2 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} />
-          <button onClick={() => { if (newName.trim()) { saveFleet({ ...fleet, drivers: [...fleet.drivers, newName.trim()] }); setNewName(""); } }} className="px-4 rounded-lg text-white font-semibold" style={{ background: DARK }}>Add</button>
-        </div>
-      </div>
-    );
+    return <div className="text-sm text-gray-500 bg-white rounded-xl p-4 border" style={{ borderColor: "#e5e5e5" }}>Please sign out and sign in again with your name and password.</div>;
   }
 
   const myPending = (data.leave || []).filter(l => l.driver === driver && l.status === "pending").length;
@@ -893,7 +963,6 @@ function DriverView({ driver, setDriver, fleet, data, activeTrip, addTrip, updTr
     <div>
       <div className="flex justify-between items-center mb-3">
         <div><div className="text-xs text-gray-400">Driver</div><div className="font-bold" style={{ color: DARK }}>{driver}</div></div>
-        <button onClick={() => setDriver(null)} className="text-xs underline text-gray-500">Switch</button>
       </div>
       <Tabs value={tab} onChange={setTab} tabs={[{ k: "trip", label: "My Trip" }, { k: "leave", label: "Leave", badge: myPending || null }, { k: "faults", label: "Faults", badge: myOpenFaults || null }]} />
       {tab === "trip"
@@ -2152,13 +2221,9 @@ function FleetAdmin({ fleet, saveFleet }) {
   const [d, setD] = useState(""); const [vr, setVr] = useState(""); const [vm, setVm] = useState(""); const [tr, setTr] = useState(""); const [imp, setImp] = useState("");
   return (
     <div className="mt-5">
-      <button onClick={() => setOpen(o => !o)} className="text-sm underline text-gray-500">{open ? "Hide" : "Manage"} fleet & drivers</button>
+      <button onClick={() => setOpen(o => !o)} className="text-sm underline text-gray-500">{open ? "Hide" : "Manage"} trucks & trailers</button>
       {open && (
         <div className="bg-white rounded-xl p-3 border shadow-sm mt-2 space-y-3" style={{ borderColor: "#e5e5e5" }}>
-          <div>
-            <div className="text-xs font-bold text-gray-500 mb-1">Add driver</div>
-            <div className="flex gap-2"><input value={d} onChange={e => setD(e.target.value)} placeholder="Name" className="flex-1 px-2 py-1.5 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} /><button onClick={() => { if (d.trim()) { saveFleet({ ...fleet, drivers: [...fleet.drivers, d.trim()] }); setD(""); } }} className="px-3 rounded-lg text-white text-sm font-semibold" style={{ background: DARK }}>+</button></div>
-          </div>
           <div>
             <div className="text-xs font-bold text-gray-500 mb-1">Add truck</div>
             <div className="flex gap-2"><input value={vr} onChange={e => setVr(e.target.value)} placeholder="Reg" className="w-1/3 px-2 py-1.5 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} /><input value={vm} onChange={e => setVm(e.target.value)} placeholder="Make" className="flex-1 px-2 py-1.5 rounded-lg border text-sm" style={{ borderColor: "#ddd" }} /><button onClick={() => { if (vr.trim()) { saveFleet({ ...fleet, vehicles: [...fleet.vehicles, { reg: vr.trim(), make: vm.trim() }] }); setVr(""); setVm(""); } }} className="px-3 rounded-lg text-white text-sm font-semibold" style={{ background: DARK }}>+</button></div>

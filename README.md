@@ -3,11 +3,15 @@
 Flat layout (all code at the top level) so GitHub web uploads can't nest files wrong.
 
 ## Logins
-- Driver - taps name, no PIN
+- Driver - selects name + personal password (set in the Admin back office)
 - Operations - PIN: Avemel26
-- Admin & Payroll - PIN: Avemel27
+- HR & Payroll - PIN: Avemel27
 - Workshop - PIN: Avemel28
-Change PINs in App.jsx (OPS_PIN / ADMIN_PIN / WORKSHOP_PIN).
+- Admin (back office: add/remove drivers, set driver passwords) - PIN: 2418
+Change PINs in App.jsx (OPS_PIN / ADMIN_PIN / WORKSHOP_PIN / BACKEND_PIN).
+
+Drivers only ever see their own trips, leave and faults. A driver can't log in
+until an Admin sets their password under Admin -> Drivers & passwords.
 
 ## Announcements
 - Post from Admin & Payroll -> Announce (title, message, urgent toggle).
