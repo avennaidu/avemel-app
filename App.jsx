@@ -253,12 +253,33 @@ const CHECKLIST = [
 const ALL_ITEMS = CHECKLIST.flatMap(g => g.items);
 const ANGLES = [["front", "Front"], ["left", "Left side"], ["right", "Right side"], ["rear", "Rear"]];
 
-async function sget(key) {
-  try { const r = await window.storage.get(key, true); return r ? JSON.parse(r.value) : null; }
-  catch { return null; }
+// A read can fail (no signal, flaky mobile data, server 5xx) or it can legitimately
+// find nothing. Those are NOT the same thing. Treating a failed read as "nothing is
+// stored" is what used to overwrite the live fleet with SEED - wiping added trailers
+// and trucks, every driver password and all leave balances.
+// ok:false means "we could not find out" - the caller must leave stored data alone.
+async function sread(key, tries = 3) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await window.storage.get(key, true);
+      return { ok: true, value: r ? JSON.parse(r.value) : null };
+    } catch (e) {
+      if (i === tries - 1) { console.warn("[Avemel] read failed for", key, e); return { ok: false, value: null }; }
+      await new Promise(res => setTimeout(res, 400 * (i + 1)));
+    }
+  }
 }
-async function sset(key, val) {
-  try { await window.storage.set(key, JSON.stringify(val), true); } catch {}
+// Returns true only if the write actually landed, so callers can tell the user
+// instead of showing a change that was never saved.
+async function sset(key, val, tries = 3) {
+  for (let i = 0; i < tries; i++) {
+    try { await window.storage.set(key, JSON.stringify(val), true); return true; }
+    catch (e) {
+      if (i === tries - 1) { console.warn("[Avemel] write failed for", key, e); return false; }
+      await new Promise(res => setTimeout(res, 400 * (i + 1)));
+    }
+  }
+  return false;
 }
 
 function compress(file, max = 900, q = 0.55) {
@@ -895,6 +916,11 @@ export default function App() {
   const [data, setData] = useState({ trips: [], leave: [], payslips: {}, faults: [], announcements: [], updatedAt: 0 });
   const [fleet, setFleet] = useState({ ...SEED, rates: RATE_DEFAULTS, driverAuth: {}, updatedAt: 0 });
   const [ready, setReady] = useState(false);
+  // Could we read the existing data? Until this is true nothing may be written back,
+  // otherwise a blank/seeded screen overwrites the real records on the server.
+  const loadedRef = useRef(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saveFailed, setSaveFailed] = useState(false);
   const dataRef = useRef(data); useEffect(() => { dataRef.current = data; }, [data]);
   const fleetRef = useRef(fleet); useEffect(() => { fleetRef.current = fleet; }, [fleet]);
 
@@ -923,24 +949,45 @@ export default function App() {
   const setDriverPersist = (d) => { setDriver(d); if (session?.role === "driver") { const ns = { role: "driver", driver: d }; setSession(ns); persistSession(ns); } };
 
   useEffect(() => {
-    (async () => {
-      const d = await sget("avemel:data:v2");
-      const f = await sget("avemel:fleet:v3");
-      setData(d ? { trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, faults: d.faults || [], announcements: d.announcements || [], updatedAt: d.updatedAt || 0 } : { trips: [], leave: [], payslips: {}, faults: [], announcements: [], updatedAt: 0 });
-      if (f) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS, driverAuth: f.driverAuth || {} }); else sset("avemel:fleet:v3", { ...SEED, rates: RATE_DEFAULTS, driverAuth: {}, updatedAt: Date.now() });
-      setReady(true);
-    })();
+    const applyData = (d) => setData({ trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, faults: d.faults || [], announcements: d.announcements || [], updatedAt: d.updatedAt || 0 });
+    const applyFleet = (f) => setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS, driverAuth: f.driverAuth || {} });
+
+    // Both reads must succeed before we trust what we have. If either one failed we
+    // know nothing, so we seed nothing, clear nothing and block saving (see loadedRef
+    // in saveData/saveFleet) until a later attempt gets a clean read.
+    const load = async () => {
+      const dRes = await sread("avemel:data:v2");
+      const fRes = await sread("avemel:fleet:v3");
+      if (!dRes.ok || !fRes.ok) return false;
+      if (dRes.value) applyData(dRes.value);
+      if (fRes.value) applyFleet(fRes.value);
+      // Only seed when the read definitely came back empty - a genuine first run.
+      else if (!(await sset("avemel:fleet:v3", { ...SEED, rates: RATE_DEFAULTS, driverAuth: {}, updatedAt: Date.now() }))) return false;
+      loadedRef.current = true;
+      return true;
+    };
+
+    (async () => { setLoadFailed(!(await load())); setReady(true); })();
+
     const iv = setInterval(async () => {
-      const d = await sget("avemel:data:v2");
-      if (d && (d.updatedAt || 0) > dataRef.current.updatedAt) setData({ trips: d.trips || [], leave: d.leave || [], payslips: d.payslips || {}, faults: d.faults || [], announcements: d.announcements || [], updatedAt: d.updatedAt || 0 });
-      const f = await sget("avemel:fleet:v3");
-      if (f && (f.updatedAt || 0) > fleetRef.current.updatedAt) setFleet({ ...f, balances: f.balances || {}, tenure: f.tenure || {}, rates: f.rates || RATE_DEFAULTS, driverAuth: f.driverAuth || {} });
+      // Still recovering from a bad start - keep retrying rather than running blind.
+      if (!loadedRef.current) { const ok = await load(); setLoadFailed(!ok); return; }
+      const dRes = await sread("avemel:data:v2", 1);
+      if (dRes.ok && dRes.value && (dRes.value.updatedAt || 0) > dataRef.current.updatedAt) applyData(dRes.value);
+      const fRes = await sread("avemel:fleet:v3", 1);
+      if (fRes.ok && fRes.value && (fRes.value.updatedAt || 0) > fleetRef.current.updatedAt) applyFleet(fRes.value);
     }, 8000);
     return () => clearInterval(iv);
   }, []);
 
-  const saveData = (next) => { next.updatedAt = Date.now(); setData(next); sset("avemel:data:v2", next); };
-  const saveFleet = (next) => { next.updatedAt = Date.now(); setFleet(next); sset("avemel:fleet:v3", next); };
+  // Never write from a baseline we never managed to read - that is how a momentary
+  // signal drop used to erase trailers, trucks and driver passwords for everyone.
+  const persist = async (key, next) => {
+    if (!loadedRef.current) { setSaveFailed(true); return; }
+    setSaveFailed(!(await sset(key, next)));
+  };
+  const saveData = (next) => { next.updatedAt = Date.now(); setData(next); persist("avemel:data:v2", next); };
+  const saveFleet = (next) => { next.updatedAt = Date.now(); setFleet(next); persist("avemel:fleet:v3", next); };
   const addTrip = (t) => saveData({ ...dataRef.current, trips: [t, ...dataRef.current.trips] });
   const updTrip = (id, fn) => saveData({ ...dataRef.current, trips: dataRef.current.trips.map(t => t.id === id ? fn({ ...t }) : t) });
   const addLeave = (a) => saveData({ ...dataRef.current, leave: [a, ...(dataRef.current.leave || [])] });
@@ -997,7 +1044,17 @@ export default function App() {
   const rates = fleet.rates || RATE_DEFAULTS;
   const activeTrip = driver ? data.trips.find(t => t.driver === driver && t.status !== "closed") : null;
 
-  if (!ready) return <div className="p-8 text-center text-gray-400">Loading\u2026</div>;
+  if (!ready) return <div className="p-8 text-center text-gray-400">{"Loading\u2026"}</div>;
+
+  // Refuse to run on data we could not load. Showing the seeded defaults here would
+  // let the next save wipe the real fleet, passwords and trips for everyone.
+  if (loadFailed) return (
+    <div className="p-8 text-center">
+      <div className="font-bold mb-2" style={{ color: RED }}>Can&apos;t reach the server</div>
+      <p className="text-sm text-gray-500 mb-4">Your data is safe - it just can&apos;t be loaded right now. Check your signal and try again.</p>
+      <button onClick={() => location.reload()} className="px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: RED }}>Retry</button>
+    </div>
+  );
 
   const role = session?.role;
   const roleLabel = !session ? "" : { driver: "Driver App", ops: "Control Room", admin: "HR & Payroll", workshop: "Workshop", backend: "Admin" }[role];
@@ -1019,6 +1076,12 @@ export default function App() {
           </div>
         ) : <span className="text-xs font-semibold" style={{ color: "#9a9a9a" }}>Sign in</span>}
       </div>
+      {saveFailed && (
+        <div className="px-4 py-2 text-xs font-semibold text-white flex items-center justify-between" style={{ background: RED }}>
+          <span>Not saved - no connection. Your last change was not stored.</span>
+          <button onClick={() => location.reload()} className="underline ml-3 shrink-0">Reload</button>
+        </div>
+      )}
 
       {bellOpen && <AnnouncementsPanel announcements={data.announcements || []} seen={seen} onClose={closeBell} />}
 

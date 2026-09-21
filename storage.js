@@ -7,7 +7,7 @@ const supabase = {
   async get(key) {
     const r = await fetch(`${base}/rest/v1/kv_store?select=value&key=eq.${encodeURIComponent(key)}`, { headers });
     if (!r.ok) throw new Error("get " + r.status);
-    const rows = await r.json(); if (!rows.length) throw new Error("not found");
+    const rows = await r.json(); if (!rows.length) return null;
     return { key, value: rows[0].value };
   },
   async set(key, value) {
@@ -16,7 +16,7 @@ const supabase = {
   },
 };
 const local = {
-  async get(key) { const v = localStorage.getItem("avemel-kv:" + key); if (v === null) throw new Error("not found"); return { key, value: v }; },
+  async get(key) { const v = localStorage.getItem("avemel-kv:" + key); if (v === null) return null; return { key, value: v }; },
   async set(key, value) { localStorage.setItem("avemel-kv:" + key, value); return { key, value }; },
 };
 const backend = useSupabase ? supabase : local;
